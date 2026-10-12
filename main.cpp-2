@@ -1,0 +1,191 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstdint>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <wininet.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "wininet.lib")
+
+// Структура заголовка MRT (RFC 6396)
+struct MrtHeader {
+    uint32_t timestamp;
+    uint16_t type;
+    uint16_t subtype;
+    uint32_t length;
+};
+
+// Функция для смены порядка байт (Big Endian -> Little Endian)
+uint32_t read_network_32(const uint8_t* buf) {
+    return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+}
+uint16_t read_network_16(const uint8_t* buf) {
+    return (buf[0] << 8) | buf[1];
+}
+
+// Нативное скачивание файла через Windows WinINet API
+bool download_file(const std::wstring& url, const std::wstring& output_path) {
+    HINTERNET hInternet = InternetOpenW(L"RouteViewsParser", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (!hInternet) return false;
+
+    HINTERNET hUrl = InternetOpenUrlW(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out) {
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    while (InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+        out.write(buffer, bytesRead);
+    }
+
+    out.close();
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInternet);
+    return true;
+}
+
+// Парсинг уже распакованного/скачанного MRT файла
+void parse_mrt_file(const std::wstring& filepath) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        std::wcerr << L"Не удалось открыть файл: " << filepath << std::endl;
+        return;
+    }
+
+    // Выводим CSV заголовок
+    std::cout << "IP_Version,Prefix,Length,AS_Path\n";
+
+    std::vector<uint8_t> header_buf(12);
+    while (file.read(reinterpret_cast<char*>(header_buf.data()), 12)) {
+        MrtHeader header;
+        header.timestamp = read_network_32(&header_buf[0]);
+        header.type      = read_network_16(&header_buf[4]);
+        header.subtype   = read_network_16(&header_buf[6]);
+        header.length    = read_network_32(&header_buf[8]);
+
+        std::vector<uint8_t> body(header.length);
+        if (!file.read(reinterpret_cast<char*>(body.data()), header.length)) break;
+
+        // Фильтруем TABLE_DUMP_V2 (Type 13), подтипы RIB_IPV4_UNICAST (2) и RIB_IPV6_UNICAST (4)
+        if (header.type == 13 && (header.subtype == 2 || header.subtype == 4)) {
+            size_t offset = 0;
+            if (offset + 4 > body.size()) continue;
+            
+            uint32_t seq = read_network_32(&body[offset]); offset += 4;
+            uint8_t pfx_len = body[offset]; offset += 1;
+            
+            size_t bytes_to_read = (pfx_len + 7) / 8;
+            if (offset + bytes_to_read > body.size()) continue;
+
+            // Извлекаем IP-префикс
+            char ip_str[INET6_ADDRSTRLEN] = {0};
+            if (header.subtype == 2) { // IPv4
+                in_addr addr = {0};
+                memcpy(&addr, &body[offset], (std::min)(bytes_to_read, size_t(4)));
+                inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+            } else { // IPv6
+                in6_addr addr = {0};
+                memcpy(&addr, &body[offset], (std::min)(bytes_to_read, size_t(16)));
+                inet_ntop(AF_INET6, &addr, ip_str, sizeof(ip_str));
+            }
+            offset += bytes_to_read;
+
+            // Читаем количество записей в RIB (Entry Count)
+            if (offset + 2 > body.size()) continue;
+            uint16_t entry_count = read_network_16(&body[offset]); offset += 2;
+
+            for (uint16_t i = 0; i < entry_count; ++i) {
+                if (offset + 8 > body.size()) break;
+                uint16_t peer_index = read_network_16(&body[offset]); offset += 2;
+                uint32_t orig_time = read_network_32(&body[offset]); offset += 4;
+                uint16_t attr_len = read_network_16(&body[offset]); offset += 2;
+
+                if (offset + attr_len > body.size()) break;
+                
+                // Простейший парсинг BGP Path Attributes для поиска AS_PATH (Type 2)
+                size_t attr_end = offset + attr_len;
+                std::string as_path_str = "";
+
+                while (offset < attr_end) {
+                    if (offset + 2 > attr_end) break;
+                    uint8_t flags = body[offset];
+                    uint8_t attr_type = body[offset + 1];
+                    offset += 2;
+
+                    size_t len_bytes = (flags & 0x10) ? 2 : 1; // Extended Length flag
+                    if (offset + len_bytes > attr_end) break;
+                    
+                    uint16_t current_attr_len = 0;
+                    if (len_bytes == 1) {
+                        current_attr_len = body[offset];
+                    } else {
+                        current_attr_len = read_network_16(&body[offset]);
+                    }
+                    offset += len_bytes;
+
+                    // Если это AS_PATH
+                    if (attr_type == 2) {
+                        size_t path_offset = offset;
+                        size_t path_end = offset + current_attr_len;
+                        while (path_offset < path_end) {
+                            if (path_offset + 2 > path_end) break;
+                            uint8_t segment_type = body[path_offset];
+                            uint8_t segment_len = body[path_offset + 1];
+                            path_offset += 2;
+
+                            // 4-байтовые ASN (стандарт для современных RouteViews)
+                            for (uint8_t j = 0; j < segment_len; ++j) {
+                                if (path_offset + 4 > path_end) break;
+                                uint32_t asn = read_network_32(&body[path_offset]);
+                                as_path_str += std::to_string(asn) + " ";
+                                path_offset += 4;
+                            }
+                        }
+                    }
+                    offset += current_attr_len;
+                }
+
+                // Убираем лишний пробел в конце AS_PATH
+                if (!as_path_str.empty()) as_path_str.pop_back();
+
+                // Печать строки в CSV
+                std::cout << (header.subtype == 2 ? "IPv4" : "IPv6") << ","
+                          << ip_str << ","
+                          << (int)pfx_len << ","
+                          << "\"" << as_path_str << "\"\n";
+                
+                offset = attr_end; // Гарантированно переходим к следующему атрибуту
+            }
+        }
+    }
+}
+
+int main() {
+    // Инициализация сокетов Windows для корректной работы inet_ntop
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // ВАЖНО: RouteViews хранит дампы в формате .bz2. 
+    // Поскольку в Windows нет нативной распаковки bz2, данный парсер ожидает РАСПАКОВАННЫЙ .mrt файл.
+    // Вы можете скачать готовый несжатый RIB или распаковать его утилитой 7-Zip перед запуском.
+    std::wstring local_mrt_file = L"rib.mrt"; 
+
+    std::wcout << L"Анализ MRT файла: " << local_mrt_file << std::endl;
+    parse_mrt_file(local_mrt_file);
+
+    WSACleanup();
+    return 0;
+}

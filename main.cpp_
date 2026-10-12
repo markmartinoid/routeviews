@@ -1,0 +1,116 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <curl/curl.h>
+#include <bgpdump_lib.h>
+#include <bgpdump_attr.h>
+
+// Функция для обратного вызова cURL (скачивание файла в поток)
+size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    size_t written = fwrite(ptr, size, nmemb, stream);
+    return written;
+}
+
+// Функция автоматического скачивания актуального дампа RouteViews
+bool download_routeviews_dump(const std::string& url, const std::string& output_path) {
+    CURL *curl;
+    FILE *fp;
+    CURLcode res;
+    
+    curl = curl_easy_init();
+    if (!curl) return false;
+    
+    fp = fopen(output_path.c_str(), "wb");
+    if (!fp) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    
+    std::cout << "Скачивание дампа из RouteViews... " << std::endl;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "RouteViews-C++-Parser/1.0");
+    
+    res = curl_easy_perform(curl);
+    
+    fclose(fp);
+    curl_easy_cleanup(curl);
+    
+    return (res == CURLE_OK);
+}
+
+int main() {
+    // Ссылка на тестовый (небольшой) архив обновлений или RIB с RouteViews (формат MRT, сжатый bzip2)
+    // В реальной задаче вы можете динамически формировать дату в URL
+    std::string dump_url = "http://routeviews.org";
+    std::string local_filename = "routeviews_dump.bz2";
+
+    // Инициализируем cURL
+    //curl_global_init(CURL_GLOBAL_ALL);
+
+    //if (!download_routeviews_dump(dump_url, local_filename)) {
+    //    std::cerr << "Ошибка при скачивании файла!" << std::endl;
+    //    return 1;
+    //}
+    //std::cout << "Файл успешно скачан. Начинаем парсинг..." << std::endl;
+
+    // Открываем MRT файл с помощью libbgpdump (она сама определяет bzip2/gzip)
+    BGPDUMP *dump = bgpdump_open(local_filename.c_str());
+    if (!dump) {
+        std::cerr << "Не удалось открыть MRT файл через libbgpdump!" << std::endl;
+        return 1;
+    }
+
+    BGPDUMP_ENTRY *entry = nullptr;
+    
+    // Выводим CSV заголовок в stdout
+    std::cout << "type,prefix,prefix_len,as_path" << std::endl;
+
+    // Построчно читаем бинарные MRT записи (поддерживает и IPv4, и IPv6)
+    while ((entry = bgpdump_read(dump)) != nullptr) {
+        // Проверяем, что в записи есть объявленные маршруты (NLRI) или это RIB дамп
+        if (entry->attr != nullptr) {
+            char prefix_str[INET6_ADDRSTRLEN];
+            std::string ip_version = "UNKNOWN";
+
+            // Определяем тип протокола IPv4 или IPv6
+            if (entry->prefix.family == AF_INET) {
+                inet_ntop(AF_INET, &entry->prefix.address.ipv4, prefix_str, sizeof(prefix_str));
+                ip_version = "IPv4";
+            } else if (entry->prefix.family == AF_INET6) {
+                inet_ntop(AF_INET6, &entry->prefix.address.ipv6, prefix_str, sizeof(prefix_str));
+                ip_version = "IPv6";
+            }
+
+            // Извлекаем AS_PATH
+            std::string as_path = "";
+            if (entry->attr->aspath != nullptr) {
+                // Преобразуем внутреннюю структуру aspath в строку формата "1234 5678 9910"
+                char *parsed_path = aspath_print(entry->attr->aspath);
+                if (parsed_path) {
+                    as_path = parsed_path;
+                    free(parsed_path); // Очищаем память за функцией библиотеки
+                }
+            }
+
+            // Выводим готовую строку в формате CSV
+            // Пример: IPv4,192.0.2.0,24,64496 64511
+            std::cout << ip_version << "," 
+                      << prefix_str << "," 
+                      << (int)entry->prefix.len << "," 
+                      << "\"" << as_path << "\"" << std::endl;
+        }
+        
+        // Освобождаем память текущей записи перед переходом к следующей
+        bgpdump_free_mem(entry);
+    }
+
+    // Закрываем дескриптор файла
+    bgpdump_close(dump);
+    curl_global_cleanup();
+
+    std::cout << "--- Парсинг завершен ---" << std::endl;
+    return 0;
+}
